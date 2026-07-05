@@ -21,7 +21,8 @@ def print_prompt(prompt):
 
 # ==================== 查询意图识别 ====================
 
-# 列举型查询关键词：用户想"列出/查看全部用例"而非"找最相关的几条"
+# 列举型查询关键词（作为 LLM 意图识别失败时的兜底策略）
+# 当大模型调用异常时，回退到关键词匹配保证服务可用
 LIST_QUERY_KEYWORDS = [
     "有哪些用例", "列出用例", "列出所有", "显示所有", "查看所有",
     "所有用例", "全部用例", "用例列表", "用例清单", "包含哪些",
@@ -30,16 +31,15 @@ LIST_QUERY_KEYWORDS = [
 ]
 
 
-def is_list_query(user_input: str) -> bool:
-    """判断用户提问是否为列举型查询（想看全部用例而非找最相关的几条）。
+def _is_list_query_fallback(user_input: str) -> bool:
+    """关键词兜底判定：当 LLM 意图识别不可用时使用。
 
     特征：包含"有哪些用例""列出""全部""所有"等关键词。
-    这类查询应走元数据全量查询，而非向量相似度 top-k 检索，避免漏掉用例。
+    返回 True 表示列举型查询，应走元数据全量查询。
     """
     if not user_input:
         return False
     text = user_input.strip()
-    # 关键词命中即为列举型查询
     for kw in LIST_QUERY_KEYWORDS:
         if kw in text:
             return True
@@ -53,10 +53,18 @@ def extract_dataset_from_query(user_input: str):
     "数据集 3333" → "3333"
     "3333数据集" → "3333"
     "数据集V1.0回归测试的用例" → "V1.0回归测试"
+    "给我所有数据集的支付模块的测试用例" → None（用户想看所有数据集，不限定）
     匹配不到返回 None。
     """
     if not user_input:
         return None
+
+    # 用户明确想看"所有/全部/各"数据集时，不限定数据集，直接返回 None
+    all_dataset_keywords = ["所有数据集", "全部数据集", "各数据集", "每一个数据集", "所有数据集合", "全部的数据集"]
+    for kw in all_dataset_keywords:
+        if kw in user_input:
+            return None
+
     # 匹配 "数据集xxx" 或 "xxx数据集"
     # 数据集名可能含中文、字母、数字、点、下划线
     patterns = [
@@ -76,13 +84,17 @@ def extract_dataset_from_query(user_input: str):
         m = re.search(pat, user_input)
         if m:
             name = m.group(1).strip()
+            # 提取结果以"的"开头或结尾视为无效（如"的支付模块"是错误提取）
+            if name.startswith("的") or name.endswith("的"):
+                continue
             # 按分隔词截断，取数据集名部分
             for sep in separators:
                 idx = name.find(sep)
                 if idx > 0:
                     name = name[:idx].strip()
                     break
-            if name:
+            # 截断后再次校验，避免残留"的"
+            if name and not name.startswith("的") and not name.endswith("的"):
                 return name
     return None
 
@@ -124,18 +136,52 @@ class RagService(object):
 
         self.chat_model = ChatTongyi(model=config.chat_model_name)
 
+        # 意图识别专用模型：用轻量模型 + temperature=0，兼顾速度与稳定性
+        self.intent_model = ChatTongyi(
+            model=config.intent_model_name,
+            temperature=0.0,
+        )
+        # 意图识别 prompt：强制模型只返回 LIST 或 SEMANTIC，便于程序解析
+        # 注意：字符串内避免使用中文全角引号，否则 Python 会误判字符串边界
+        self.intent_prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             "你是一个查询意图分类器。请判断用户的提问属于以下哪种类型：\n"
+             "- LIST：用户想查看、列举、统计一批用例。特征是关注 有多少、有哪些、全部、所有、列出、给我 等词，"
+             "期望得到完整列表而非个别用例的细节。\n"
+             "- SEMANTIC：用户想了解某个具体问题、查找特定用例的步骤或预期结果、寻求测试建议等，"
+             "期望得到针对性的回答。\n\n"
+             "判断要点：\n"
+             "1. 用户想看 全部、所有、有哪些 用例 → LIST\n"
+             "2. 用户想统计用例数量、查看用例清单 → LIST\n"
+             "3. 用户问某个功能怎么测、某条用例的预期结果、某模块的测试要点 → SEMANTIC\n"
+             "4. 模棱两可时，若用户明确要求 全部 或 所有 则判 LIST，否则判 SEMANTIC\n"
+             "5. 关键判据：用户是否期望看到一批用例的完整列表。只要提问中有 所有、全部、各 等词修饰用例范围，就判 LIST\n\n"
+             "示例：\n"
+             "- 给我所有数据集的支付模块的测试用例 → LIST（用户要全部支付用例）\n"
+             "- 列出登录模块的用例 → LIST\n"
+             "- 支付功能怎么测 → SEMANTIC\n"
+             "- TC_001的预期结果是什么 → SEMANTIC\n\n"
+             "只返回 LIST 或 SEMANTIC 这一个词，不要输出任何其他内容。"),
+            ("user", "{question}")
+        ])
+
         self.chain = self.__get_chain()
 
-    def _get_all_cases_as_docs(self, dataset_override=None):
+    def _get_all_cases_as_docs(self, dataset_override=None, module_override=None):
         """按当前过滤条件全量查询用例（用于列举型查询），返回 Document 列表。
 
         :param dataset_override: 若指定则覆盖 dataset 过滤条件
                                 （用于从用户提问中提取数据集名的情况）
+        :param module_override: 若指定则按 module 过滤
+                                （用于从用户提问中提取模块名的情况）
         """
         where = {}
         if dataset_override:
             where["dataset"] = dataset_override
-        elif self.metadata_filter:
+        if module_override:
+            where["module"] = module_override
+        # 若未显式指定 dataset/module，则回退到构造时的 metadata_filter
+        if not where and self.metadata_filter:
             where = dict(self.metadata_filter)
 
         try:
@@ -153,6 +199,59 @@ class RagService(object):
         except Exception as e:
             print(f"全量查询用例失败: {e}")
             return []
+
+    def _extract_module_from_query(self, user_input: str):
+        """从用户提问中提取模块名：匹配知识库中已存在的模块名。
+
+        例如"支付模块的测试用例" → "支付"
+        "登录模块有哪些用例" → "登录"
+        匹配不到返回 None。
+        """
+        if not user_input:
+            return None
+        try:
+            # 取知识库中所有模块名
+            result = self.collection.get(include=["metadatas"])
+            modules = set()
+            for meta in result.get("metadatas", []):
+                m = meta.get("module", "")
+                if m:
+                    modules.add(m)
+            # 按模块名长度降序匹配，避免短模块名被长模块名包含导致误匹配
+            for mod in sorted(modules, key=len, reverse=True):
+                if mod in user_input:
+                    return mod
+        except Exception as e:
+            print(f"提取模块名失败: {e}")
+        return None
+
+    def _detect_query_intent(self, user_input: str) -> bool:
+        """用大模型判断用户提问是否为列举型查询。
+
+        调用轻量模型（intent_model）做意图分类，返回 True 表示列举型。
+        若 LLM 调用失败，回退到关键词匹配（_is_list_query_fallback）保证服务可用。
+        """
+        if not user_input or not user_input.strip():
+            return False
+
+        try:
+            # 构建意图识别链：prompt → 模型 → 纯文本解析
+            intent_chain = self.intent_prompt | self.intent_model | StrOutputParser()
+            raw_result = intent_chain.invoke({"question": user_input})
+            # 清理返回内容：去空白、转大写，便于匹配
+            result = raw_result.strip().upper()
+
+            # 容错解析：只要返回内容包含 LIST 即判定为列举型
+            if "LIST" in result:
+                print(f"[意图识别] LLM判定: 列举型 (返回: {raw_result.strip()})")
+                return True
+            else:
+                print(f"[意图识别] LLM判定: 语义型 (返回: {raw_result.strip()})")
+                return False
+        except Exception as e:
+            # LLM 调用异常时回退到关键词匹配，保证服务不中断
+            print(f"[意图识别] LLM调用失败({e})，回退到关键词匹配")
+            return _is_list_query_fallback(user_input)
 
     def __get_chain(self):
         """获取最终的执行链"""
@@ -180,12 +279,21 @@ class RagService(object):
             """
             user_input = value.get("input", "")
 
-            if is_list_query(user_input):
-                # 尝试从提问中提取数据集名，进一步缩小范围
+            if self._detect_query_intent(user_input):
+                # 列举型查询：尝试从提问中提取数据集名和模块名，缩小全量查询范围
                 ds_in_query = extract_dataset_from_query(user_input)
-                docs = self._get_all_cases_as_docs(dataset_override=ds_in_query)
-                print(f"[路由] 识别为列举型查询，全量返回 {len(docs)} 条用例"
-                      f"{' (数据集: ' + ds_in_query + ')' if ds_in_query else ''}")
+                mod_in_query = self._extract_module_from_query(user_input)
+                docs = self._get_all_cases_as_docs(
+                    dataset_override=ds_in_query,
+                    module_override=mod_in_query,
+                )
+                scope = []
+                if ds_in_query:
+                    scope.append(f"数据集: {ds_in_query}")
+                if mod_in_query:
+                    scope.append(f"模块: {mod_in_query}")
+                scope_str = f" ({', '.join(scope)})" if scope else ""
+                print(f"[路由] 识别为列举型查询，全量返回 {len(docs)} 条用例{scope_str}")
             else:
                 docs = retriever.invoke(user_input)
                 print(f"[路由] 语义检索，返回 {len(docs)} 条用例")

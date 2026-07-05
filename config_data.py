@@ -22,6 +22,10 @@ similarity_threshold = 10
 embedding_model_name = "text-embedding-v4"
 chat_model_name = "qwen3-max"
 
+# 意图识别专用模型：用轻量模型降低延迟和成本（仅判断查询类型，不需要强推理能力）
+# temperature 设为 0 保证判定结果稳定
+intent_model_name = "qwen-turbo"
+
 session_config = {
         "configurable": {
             "session_id": "user_001",
