@@ -1,0 +1,71 @@
+# ==================== 敏感数据 / 运行时数据 ====================
+# 向量数据库（含已导入的测试用例，属运行时数据，不应上传）
+chroma_db/
+
+# 聊天历史（含用户真实对话内容）
+chat_history/
+
+# 文件去重哈希记录（运行时生成）
+md5.text
+
+# ==================== 环境变量 / 密钥 ====================
+.env
+.env.local
+.env.*.local
+
+# ==================== Python ====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv/
+
+# ==================== IDE / 编辑器 ====================
+# JetBrains（PyCharm 等）
+.idea/
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# 其他编辑器
+*.swp
+*.swo
+*~
+
+# ==================== 操作系统 ====================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==================== Streamlit ====================
+.streamlit/secrets.toml
+
+# ==================== AI 助手记忆 / 工作日志 ====================
+.workbuddy/
+
+# ==================== 日志 / 临时文件 ====================
+*.log
+*.tmp
+*.bak

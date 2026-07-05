@@ -1,0 +1,24 @@
+# 测试用例 RAG 平台 - Python 依赖
+# 安装命令：pip install -r requirements.txt
+
+# Web 前端
+streamlit>=1.30.0
+
+# LangChain 核心与社区集成
+langchain>=0.2.0
+langchain-core>=0.2.0
+langchain-community>=0.2.0
+langchain-chroma>=0.1.0
+
+# 阿里百炼 DashScope（embedding + 通义千问对话模型）
+dashscope>=1.14.0
+
+# 向量数据库
+chromadb>=0.4.0
+
+# 数据处理（解析 Excel/CSV）
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# SSL 证书修复依赖（Windows OpenSSL 兼容性问题）
+certifi>=2024.0.0
